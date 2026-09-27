@@ -130,7 +130,8 @@ contract DeployScript is BaseScript {
             hostManager: address(manager),
             handler: address(handler),
             unStakingPeriod: 21 * (60 * 60 * 24),
-            challengePeriod: 0,
+            // 30-minute window for fishermen to challenge faulty state commitments
+            challengePeriod: 1800,
             consensusClient: address(consensusClient),
             hyperbridge: hyperbridge,
             feeToken: feeToken,

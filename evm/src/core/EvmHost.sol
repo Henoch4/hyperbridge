@@ -15,6 +15,7 @@
 pragma solidity ^0.8.17;
 
 import {Context} from "@openzeppelin/contracts/utils/Context.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -108,7 +109,7 @@ struct WithdrawParams {
  * It is only responsible for dispatching incoming & outgoing requests/responses. As well as managing
  * the state of the ISMP protocol.
  */
-contract EvmHost is IHost, IHostManager, Context {
+contract EvmHost is IHost, IHostManager, Context, ReentrancyGuardTransient {
     using Message for PostRequest;
     using Message for GetRequest;
     using Message for GetResponse;
@@ -333,6 +334,12 @@ contract EvmHost is IHost, IHostManager, Context {
     // Provided an unstaking period less than 24 hours
     error InvalidUnstakingPeriod();
 
+    // Provided a zero challenge period
+    error InvalidChallengePeriod();
+
+    // Provided payer is neither zero nor the message sender
+    error InvalidPayer();
+
     // Failed to withdraw the native token
     error WithdrawalFailed();
 
@@ -376,6 +383,7 @@ contract EvmHost is IHost, IHostManager, Context {
     function initialize(HostParams memory params) external {
         if (_msgSender() != _hostParams.admin) revert UnauthorizedAction();
         if (_initialized) revert UnauthorizedAction();
+        if (params.challengePeriod == 0) revert InvalidChallengePeriod();
         _initialized = true;
         updateHostParamsInternal(params);
     }
@@ -614,6 +622,9 @@ contract EvmHost is IHost, IHostManager, Context {
         // otherwise cannot process new datagrams
         if (1 days > params.unStakingPeriod) revert InvalidUnstakingPeriod();
 
+        // challenge period must be non-zero so fishermen can veto faulty commitments
+        if (params.challengePeriod == 0) revert InvalidChallengePeriod();
+
         address oldFeeToken = feeToken();
         if (oldFeeToken != address(0) && oldFeeToken != params.feeToken) {
             uint256 balance = IERC20(oldFeeToken).balanceOf(address(this));
@@ -791,7 +802,11 @@ contract EvmHost is IHost, IHostManager, Context {
      * @dev Dispatch an incoming POST request to destination module
      * @param request - post request
      */
-    function dispatchIncoming(PostRequest memory request, address relayer) external restrict(_hostParams.handler) {
+    function dispatchIncoming(PostRequest memory request, address relayer)
+        external
+        restrict(_hostParams.handler)
+        nonReentrant
+    {
         address destination = _bytesToAddress(request.to);
         uint256 size;
         assembly {
@@ -821,9 +836,15 @@ contract EvmHost is IHost, IHostManager, Context {
      * @dev Dispatch an incoming GET response to source module
      * @param response - get response
      */
-    function dispatchIncoming(GetResponse memory response, address relayer) external restrict(_hostParams.handler) {
+    function dispatchIncoming(GetResponse memory response, address relayer)
+        external
+        restrict(_hostParams.handler)
+        nonReentrant
+    {
         // replay protection
         bytes32 commitment = response.request.hash();
+        // cache fee before external callback to prevent reentrancy skew
+        uint256 fee = _requestCommitments[commitment].fee;
         _responseReceipts[commitment] = ResponseReceipt({
             relayer: relayer,
             responseCommitment: response.hash()
@@ -839,7 +860,6 @@ contract EvmHost is IHost, IHostManager, Context {
         }
 
         // reward the relayer fee
-        uint256 fee = _requestCommitments[commitment].fee;
         if (fee != 0) {
             IERC20(feeToken()).safeTransfer(relayer, fee);
         }
@@ -857,7 +877,7 @@ contract EvmHost is IHost, IHostManager, Context {
         GetRequestTimeout memory timeout,
         FeeMetadata memory meta,
         bytes32 commitment
-    ) external restrict(_hostParams.handler) {
+    ) external restrict(_hostParams.handler) nonReentrant {
         // replay protection
         delete _requestCommitments[commitment];
         (bool success,) = _bytesToAddress(timeout.request.from)
@@ -886,7 +906,7 @@ contract EvmHost is IHost, IHostManager, Context {
         PostRequestTimeout memory timeout,
         FeeMetadata memory meta,
         bytes32 commitment
-    ) external restrict(_hostParams.handler) {
+    ) external restrict(_hostParams.handler) nonReentrant {
         // replay protection
         delete _requestCommitments[commitment];
         (bool success,) = _bytesToAddress(timeout.request.from)
@@ -919,14 +939,20 @@ contract EvmHost is IHost, IHostManager, Context {
      * @return commitment - the request commitment
      */
     function dispatch(DispatchPost memory post) external payable notFrozen returns (bytes32 commitment) {
+        if (post.payer != address(0) && post.payer != _msgSender()) revert InvalidPayer();
         if (msg.value > 0) {
             address[] memory path = new address[](2);
             address uniswapV2 = _hostParams.uniswapV2;
             path[0] = IUniswapV2Router02(uniswapV2).WETH();
             path[1] = feeToken();
-            IUniswapV2Router02(uniswapV2).swapETHForExactTokens{value: msg.value}(
+            uint256[] memory amounts = IUniswapV2Router02(uniswapV2).swapETHForExactTokens{value: msg.value}(
                 post.fee, path, address(this), block.timestamp
             );
+            uint256 ethSpent = amounts[0];
+            if (msg.value > ethSpent) {
+                (bool refunded,) = _msgSender().call{value: msg.value - ethSpent}("");
+                if (!refunded) revert WithdrawalFailed();
+            }
         } else if (post.fee > 0) {
             IERC20(feeToken()).safeTransferFrom(_msgSender(), address(this), post.fee);
         }
@@ -945,7 +971,7 @@ contract EvmHost is IHost, IHostManager, Context {
 
         // make the commitment
         commitment = request.hash();
-        _requestCommitments[commitment] = FeeMetadata({sender: post.payer, fee: post.fee});
+        _requestCommitments[commitment] = FeeMetadata({sender: _msgSender(), fee: post.fee});
         emit PostRequestEvent({
             source: string(request.source),
             dest: string(request.dest),
@@ -972,14 +998,20 @@ contract EvmHost is IHost, IHostManager, Context {
      * @return commitment - the request commitment
      */
     function dispatch(DispatchGet memory get) external payable notFrozen returns (bytes32 commitment) {
+        if (get.payer != address(0) && get.payer != _msgSender()) revert InvalidPayer();
         if (msg.value > 0) {
             address[] memory path = new address[](2);
             address uniswapV2 = _hostParams.uniswapV2;
             path[0] = IUniswapV2Router02(uniswapV2).WETH();
             path[1] = feeToken();
-            IUniswapV2Router02(uniswapV2).swapETHForExactTokens{value: msg.value}(
+            uint256[] memory amounts = IUniswapV2Router02(uniswapV2).swapETHForExactTokens{value: msg.value}(
                 get.fee, path, address(this), block.timestamp
             );
+            uint256 ethSpent = amounts[0];
+            if (msg.value > ethSpent) {
+                (bool refunded,) = _msgSender().call{value: msg.value - ethSpent}("");
+                if (!refunded) revert WithdrawalFailed();
+            }
         } else if (get.fee > 0) {
             IERC20(feeToken()).safeTransferFrom(_msgSender(), address(this), get.fee);
         }
@@ -1034,9 +1066,14 @@ contract EvmHost is IHost, IHostManager, Context {
             address uniswapV2 = _hostParams.uniswapV2;
             path[0] = IUniswapV2Router02(uniswapV2).WETH();
             path[1] = feeToken();
-            IUniswapV2Router02(uniswapV2).swapETHForExactTokens{value: msg.value}(
+            uint256[] memory amounts = IUniswapV2Router02(uniswapV2).swapETHForExactTokens{value: msg.value}(
                 amount, path, address(this), block.timestamp
             );
+            uint256 ethSpent = amounts[0];
+            if (msg.value > ethSpent) {
+                (bool refunded,) = _msgSender().call{value: msg.value - ethSpent}("");
+                if (!refunded) revert WithdrawalFailed();
+            }
         } else {
             IERC20(feeToken()).safeTransferFrom(_msgSender(), address(this), amount);
         }
