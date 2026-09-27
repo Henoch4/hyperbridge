@@ -206,7 +206,8 @@ contract SimplexPaymaster is Initializable, HyperApp, PaymasterERC20 {
 
     uint256 public swapSlippageBps;
 
-    /// @dev The only relayer whose `onAccept` deliveries are accepted; zero means every relayer.
+    /// @dev The only relayer whose `onAccept` deliveries are accepted. Zero only on proxies
+    ///      deployed before the relayer gate, whose gate stays open until `migrate` arms it.
     address private _relayer;
 
     uint256[48] private __gap;
@@ -259,8 +260,7 @@ contract SimplexPaymaster is Initializable, HyperApp, PaymasterERC20 {
     /// @param params_  Initial pricing and treasury parameters
     /// @param tokens_  Initially supported ERC-20 tokens
     /// @param oracles_ token/USD feed for each entry in tokens_
-    /// @param relayer_ The only relayer whose governance deliveries are accepted; zero leaves
-    ///                 the gate open
+    /// @param relayer_ The only relayer whose governance deliveries are accepted; must be non-zero
     function initialize(
         address host_,
         Params memory params_,
@@ -269,6 +269,7 @@ contract SimplexPaymaster is Initializable, HyperApp, PaymasterERC20 {
         address relayer_
     ) external onlyFresh reinitializer(VERSION) {
         if (host_ == address(0) || host_.code.length == 0) revert InvalidHost();
+        if (relayer_ == address(0)) revert ZeroAddress();
         if (tokens_.length != oracles_.length) revert LengthMismatch();
 
         _hostAddr = host_;
@@ -295,7 +296,8 @@ contract SimplexPaymaster is Initializable, HyperApp, PaymasterERC20 {
         return _getInitializedVersion();
     }
 
-    /// @notice The only relayer whose governance deliveries are accepted, or zero while unset.
+    /// @notice The only relayer whose governance deliveries are accepted. Zero only on proxies
+    ///         deployed before the relayer gate, whose gate stays open until `migrate` arms it.
     function relayer() external view returns (address) {
         return _relayer;
     }
@@ -349,7 +351,10 @@ contract SimplexPaymaster is Initializable, HyperApp, PaymasterERC20 {
         if (authorised != address(0) && incomingRelayer != authorised) revert UnauthorizedRelayer();
     }
 
+    /// @dev The only writer of `_relayer`, behind `initialize`, `migrate` and `SetRelayer`.
+    ///      Never zero, matching the `migrate` gate.
     function _setRelayer(address relayer_) internal {
+        if (relayer_ == address(0)) revert ZeroAddress();
         emit RelayerUpdated(_relayer, relayer_);
         _relayer = relayer_;
     }

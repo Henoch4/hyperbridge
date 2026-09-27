@@ -433,7 +433,8 @@ abstract contract IntentsBase is EIP712 {
     }
 
     /**
-     * @notice The only relayer whose deliveries are accepted, or zero while the gate is open.
+     * @notice The only relayer whose deliveries are accepted. Zero only on proxies initialized
+     * before the gate was closed, whose gate stays open until governance rotates the relayer.
      */
     function relayer() external view returns (address) {
         return _relayer;
@@ -807,9 +808,11 @@ abstract contract IntentsBase is EIP712 {
     }
 
     /**
-     * @dev The only writer of `_relayer`, behind `initialize` and `setRelayer`.
+     * @dev The only writer of `_relayer`, behind `initialize` and `setRelayer`. Never zero: an
+     * unset gate would accept deliveries from any relayer.
      */
     function _setRelayer(address relayer_) internal {
+        if (relayer_ == address(0)) revert InvalidInput();
         emit RelayerUpdated({previous: _relayer, current: relayer_});
         _relayer = relayer_;
     }

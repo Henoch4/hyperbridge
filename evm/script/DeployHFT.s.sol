@@ -11,13 +11,15 @@ contract DeployHFT is BaseScript {
         string memory name = vm.envString("HFT_NAME");
         string memory symbol = vm.envString("HFT_SYMBOL");
 
-        CallDispatcher dispatcher = new CallDispatcher{salt: salt}();
+        CallDispatcher dispatcher = new CallDispatcher{salt: salt}(admin);
         HyperFungibleToken hft = new HyperFungibleToken{salt: salt}(name, symbol, admin);
 
         hft.configure(HyperFungibleToken.ConfigOptions({
             host: HOST_ADDRESS,
             dispatcher: address(dispatcher)
         }));
+
+        dispatcher.setAuthorized(address(hft), true);
 
         vm.stopBroadcast();
         console.log("=== HFT Deployment ===");

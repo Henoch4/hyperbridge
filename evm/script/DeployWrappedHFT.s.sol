@@ -11,7 +11,7 @@ contract DeployWrappedHFT is BaseScript {
         address underlying = vm.envAddress("UNDERLYING");
         bool isWeth = vm.envBool("IS_WETH");
 
-        CallDispatcher dispatcher = new CallDispatcher{salt: salt}();
+        CallDispatcher dispatcher = new CallDispatcher{salt: salt}(admin);
         WrappedHyperFungibleToken whft = new WrappedHyperFungibleToken{salt: salt}(admin);
 
         whft.configure(WrappedHyperFungibleToken.WrappedConfigOptions({
@@ -20,6 +20,8 @@ contract DeployWrappedHFT is BaseScript {
             underlying: underlying,
             isWeth: isWeth
         }));
+
+        dispatcher.setAuthorized(address(whft), true);
 
         vm.stopBroadcast();
         console.log("=== WrappedHFT Deployment ===");

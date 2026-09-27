@@ -68,7 +68,7 @@ abstract contract ExtrinsicIntents is IntentsBase, HyperApp {
     }
 
     /**
-     * @dev Rotates the relayer; zero accepts any. Host-only, so reached through `Execute`.
+     * @dev Rotates the relayer; never zero. Host-only, so reached through `Execute`.
      */
     function setRelayer(address relayer) external onlyHost {
         _setRelayer(relayer);

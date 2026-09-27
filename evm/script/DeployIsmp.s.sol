@@ -148,7 +148,9 @@ contract DeployScript is BaseScript {
             );
 
         // ============= Deploy applications =============
-        CallDispatcher callDispatcher = new CallDispatcher{salt: salt}();
+        // The dispatcher only executes calls for owner-authorized apps. The IntentGateway proxy is
+        // deployed by DeployIntentGateway.s.sol, which authorizes it on this dispatcher there.
+        CallDispatcher callDispatcher = new CallDispatcher{salt: salt}(admin);
         BandwidthManager bandwidthManager = new BandwidthManager{salt: salt}(admin);
         bandwidthManager.setHost(address(host));
         

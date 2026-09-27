@@ -136,6 +136,7 @@ contract IntentGatewayV2 is
         }
         _validateParams(init.params);
         _params = init.params;
+        if (init.relayer == address(0)) revert InvalidInput();
         _setRelayer(init.relayer);
         __Ownable_init(init.owner);
         __Ownable2Step_init();
