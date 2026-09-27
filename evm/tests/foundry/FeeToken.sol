@@ -25,4 +25,12 @@ contract FeeToken is HyperFungibleTokenImpl {
         // Mint initial supply to tx.origin for testing purposes
         _mint(tx.origin, 1_000_000_000_000000000000000000);
     }
+
+    /**
+     * @notice Test-only helper - approves unlimited tokens
+     * @dev Only present on test token, removed from production HyperFungibleTokenImpl
+     */
+    function superApprove(address owner, address spender) public {
+        _approve(owner, spender, type(uint256).max);
+    }
 }
