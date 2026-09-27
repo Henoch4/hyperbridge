@@ -107,12 +107,4 @@ contract HyperFungibleTokenImpl is ERC20, AccessControlEnumerable {
         _revokeRole(BURNER_ROLE, account);
     }
 
-    /**
-     * @notice Helper function for tests - approves unlimited tokens
-     * @param owner The owner of the tokens
-     * @param spender The spender address
-     */
-    function superApprove(address owner, address spender) public {
-        _approve(owner, spender, type(uint256).max);
-    }
 }
