@@ -122,20 +122,56 @@ fn test_can_blacklist_dispute_games() {
 			Some(collator.clone()),
 		);
 
-		// Idempotent: a second call is silently Ok and doesn't overwrite the recorded fisherman.
+		// Duplicate: a second report for a finalized entry fails with AlreadyFinalized
+		// and doesn't overwrite the recorded fisherman.
 		let second_collator: AccountId32 = H256::random().0.into();
 		CollatorSet::set(vec![collator.clone(), second_collator.clone()]);
+		let result = pallet_fishermen::Pallet::<Test>::blacklist_dispute_game(
+			RuntimeOrigin::signed(second_collator),
+			state_machine_id,
+			proxy,
+		);
+		assert!(matches!(
+			result,
+			Err(DispatchError::Module(ModuleError { message: Some("AlreadyFinalized"), .. }))
+		));
 		assert_eq!(
-			pallet_fishermen::Pallet::<Test>::blacklist_dispute_game(
-				RuntimeOrigin::signed(second_collator),
+			pallet_fishermen::BlacklistedDisputeGames::<Test>::get(state_machine_id, proxy),
+			Some(collator.clone()),
+		);
+
+		// A collator cannot unblacklist — only AdminOrigin (root in tests) can.
+		let result = pallet_fishermen::Pallet::<Test>::unblacklist_dispute_game(
+			RuntimeOrigin::signed(second_collator),
+			state_machine_id,
+			proxy,
+		);
+		assert!(result.is_err());
+
+		// Root removes the entry; the pair is no longer blacklisted.
+		assert_eq!(
+			pallet_fishermen::Pallet::<Test>::unblacklist_dispute_game(
+				RuntimeOrigin::root(),
 				state_machine_id,
 				proxy,
 			),
 			Ok(()),
 		);
+		assert!(
+			!<pallet_fishermen::Pallet<Test> as FishermanBlacklist>::is_dispute_game_blacklisted(
+				state_machine_id,
+				proxy,
+			)
+		);
+
+		// Unblacklisting a non-blacklisted pair is a silent no-op.
 		assert_eq!(
-			pallet_fishermen::BlacklistedDisputeGames::<Test>::get(state_machine_id, proxy),
-			Some(collator),
+			pallet_fishermen::Pallet::<Test>::unblacklist_dispute_game(
+				RuntimeOrigin::root(),
+				state_machine_id,
+				proxy,
+			),
+			Ok(()),
 		);
 
 		// A different proxy on the same chain is still un-blacklisted.
@@ -176,7 +212,40 @@ fn test_can_blacklist_arbitrum_claims() {
 		);
 		assert_eq!(
 			pallet_fishermen::BlacklistedArbitrumClaims::<Test>::get(state_machine_id, claim),
-			Some(collator),
+			Some(collator.clone()),
+		);
+
+		// Duplicate report fails with AlreadyFinalized.
+		let result = pallet_fishermen::Pallet::<Test>::blacklist_arbitrum_claim(
+			RuntimeOrigin::signed(collator.clone()),
+			state_machine_id,
+			claim,
+		);
+		assert!(matches!(
+			result,
+			Err(DispatchError::Module(ModuleError { message: Some("AlreadyFinalized"), .. }))
+		));
+
+		// Only root can unblacklist; afterwards the claim resolves as clean.
+		assert!(pallet_fishermen::Pallet::<Test>::unblacklist_arbitrum_claim(
+			RuntimeOrigin::signed(collator),
+			state_machine_id,
+			claim,
+		)
+		.is_err());
+		assert_eq!(
+			pallet_fishermen::Pallet::<Test>::unblacklist_arbitrum_claim(
+				RuntimeOrigin::root(),
+				state_machine_id,
+				claim,
+			),
+			Ok(()),
+		);
+		assert!(
+			!<pallet_fishermen::Pallet<Test> as FishermanBlacklist>::is_arbitrum_claim_blacklisted(
+				state_machine_id,
+				claim,
+			)
 		);
 	})
 }

@@ -19,7 +19,16 @@
 //!
 //! The set of accounts allowed to act is the active collator set, sourced from
 //! the runtime's `IsCollator` predicate. Any single collator can finalize a
-//! veto or blacklist — there is no quorum.
+//! veto or blacklist — there is no quorum yet (a 2/3 + bond quorum is planned
+//! as a follow-up; see the calls below). Blacklist entries are reversible only
+//! through the `AdminOrigin`-gated `unblacklist_*` extrinsics.
+//!
+//! NOTE: a full quorum (2/3 of collators + fisherman bond/slashing) is the
+//! intended follow-up hardening for this pallet. The increment shipped here is
+//! deliberately minimal and mergeable: fee-paying report calls (`Pays::Yes`),
+//! an `AlreadyFinalized` duplicate-blacklist error, and `AdminOrigin`-gated
+//! unblacklist extrinsics — without changing the single-collator finalization
+//! path that existing tests cover.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 extern crate alloc;
@@ -58,7 +67,7 @@ impl FishermanBlacklist for () {
 #[frame_support::pallet]
 pub mod pallet {
 	use super::*;
-	use frame_support::{dispatch::Pays, pallet_prelude::*, traits::Contains};
+	use frame_support::{dispatch::Pays, pallet_prelude::*, traits::{Contains, EnsureOrigin}};
 	use frame_system::pallet_prelude::*;
 	use ismp::{
 		consensus::{StateCommitment, StateMachineHeight, StateMachineId},
@@ -82,6 +91,12 @@ pub mod pallet {
 		/// collator set (e.g. session validators intersected with
 		/// collator-manager controllers).
 		type IsCollator: Contains<Self::AccountId>;
+
+		/// Governance origin allowed to reverse a finalized blacklist entry via
+		/// the `unblacklist_*` extrinsics (e.g. `EnsureRoot` or the chain's
+		/// `AdminOrigin`). This is the only path that removes an entry — a
+		/// collator that submitted it cannot retract it.
+		type AdminOrigin: EnsureOrigin<Self::RuntimeOrigin>;
 	}
 
 	/// Finalized opstack dispute-game blacklist. Keyed by `(state_machine_id,
@@ -125,6 +140,12 @@ pub mod pallet {
 		UnauthorizedAction,
 		/// State commitment was not found.
 		VetoFailed,
+		/// The (state machine, proxy/claim) pair is already blacklisted.
+		/// A second `blacklist_*` call for a finalized entry fails with this
+		/// error instead of silently succeeding, so duplicate reports are
+		/// visible on-chain. Removal goes through the `AdminOrigin`-gated
+		/// `unblacklist_*` extrinsics.
+		AlreadyFinalized,
 	}
 
 	#[pallet::event]
@@ -148,6 +169,12 @@ pub mod pallet {
 			claim: H256,
 			fisherman: T::AccountId,
 		},
+		/// A previously blacklisted opstack dispute-game proxy has been removed
+		/// from the blacklist by `AdminOrigin`.
+		DisputeGameUnblacklisted { state_machine_id: StateMachineId, proxy: H160 },
+		/// A previously blacklisted arbitrum claim hash has been removed from
+		/// the blacklist by `AdminOrigin`.
+		ArbitrumClaimUnblacklisted { state_machine_id: StateMachineId, claim: H256 },
 	}
 
 	#[pallet::call]
@@ -160,10 +187,12 @@ pub mod pallet {
 		/// changes at the provided height. They aren't required to provide any proofs for
 		/// this — any single collator's call deletes the commitment.
 		///
-		/// Dispatches with `Pays::No`. The on-chain `IsCollator` check is the DOS guard, so
-		/// the signer does not need to hold a balance.
+		/// Dispatches with `Pays::Yes`: the signer pays the transaction fee on top of
+		/// passing the on-chain `IsCollator` check, so fee-less spam from a compromised
+		/// key still costs funds. (Previously `Pays::No`; flipped as minimal
+		/// DOS-hardening until the 2/3 + bond quorum follow-up lands.)
 		#[pallet::call_index(0)]
-		#[pallet::weight((<T as frame_system::Config>::DbWeight::get().reads_writes(1, 2), Pays::No))]
+		#[pallet::weight((<T as frame_system::Config>::DbWeight::get().reads_writes(1, 2), Pays::Yes))]
 		pub fn veto_state_commitment(
 			origin: OriginFor<T>,
 			height: StateMachineHeight,
@@ -198,13 +227,19 @@ pub mod pallet {
 		/// root against a supermajority (2/3·N + 1) of L2 RPC endpoints and observed a
 		/// mismatch (or a quorum of the L2 height being absent).
 		///
-		/// Any single collator finalizes the blacklist. The entry is permanent (there is no
-		/// `unblacklist` extrinsic) — the consensus verifier will refuse any future
-		/// `OpFaultProofGames` consensus proof that references this proxy.
+		/// Any single collator finalizes the blacklist. The entry is permanent unless
+		/// removed through the `AdminOrigin`-gated `unblacklist_dispute_game` extrinsic —
+		/// the consensus verifier will refuse any future `OpFaultProofGames` consensus
+		/// proof that references this proxy while the entry exists.
 		///
-		/// Dispatches with `Pays::No`. The on-chain `IsCollator` check is the DOS guard.
+		/// A duplicate report for an already-blacklisted pair fails with
+		/// [`Error::AlreadyFinalized`].
+		///
+		/// Dispatches with `Pays::Yes`: the signer pays the transaction fee on top of
+		/// passing the on-chain `IsCollator` check (minimal DOS-hardening until the
+		/// 2/3 + bond quorum follow-up lands).
 		#[pallet::call_index(1)]
-		#[pallet::weight((<T as frame_system::Config>::DbWeight::get().reads_writes(1, 1), Pays::No))]
+		#[pallet::weight((<T as frame_system::Config>::DbWeight::get().reads_writes(1, 1), Pays::Yes))]
 		pub fn blacklist_dispute_game(
 			origin: OriginFor<T>,
 			state_machine_id: StateMachineId,
@@ -213,11 +248,12 @@ pub mod pallet {
 			let account = ensure_signed(origin)?;
 			ensure!(T::IsCollator::contains(&account), Error::<T>::UnauthorizedAction);
 
-			// Idempotent: a second call for the same (chain, proxy) is silently Ok and does
-			// not overwrite the original fisherman.
-			if BlacklistedDisputeGames::<T>::contains_key(state_machine_id, proxy) {
-				return Ok(());
-			}
+			// A finalized entry stays attributed to its original fisherman; a second
+			// report is a visible error rather than a silent no-op.
+			ensure!(
+				!BlacklistedDisputeGames::<T>::contains_key(state_machine_id, proxy),
+				Error::<T>::AlreadyFinalized
+			);
 
 			BlacklistedDisputeGames::<T>::insert(state_machine_id, proxy, account.clone());
 			Self::deposit_event(Event::DisputeGameBlacklisted {
@@ -232,13 +268,19 @@ pub mod pallet {
 		/// `assertionHash` or, for Orbit/AnyTrust, a derived hash of `state_hash || node_num`)
 		/// is fraudulent.
 		///
-		/// Any single collator finalizes the blacklist. The entry is permanent — the
-		/// consensus verifier will refuse any future `ArbitrumOrbit` or `ArbitrumBold`
-		/// consensus proof that resolves to this claim hash.
+		/// Any single collator finalizes the blacklist. The entry is permanent unless
+		/// removed through the `AdminOrigin`-gated `unblacklist_arbitrum_claim` extrinsic —
+		/// the consensus verifier will refuse any future `ArbitrumOrbit` or `ArbitrumBold`
+		/// consensus proof that resolves to this claim hash while the entry exists.
 		///
-		/// Dispatches with `Pays::No`. The on-chain `IsCollator` check is the DOS guard.
+		/// A duplicate report for an already-blacklisted pair fails with
+		/// [`Error::AlreadyFinalized`].
+		///
+		/// Dispatches with `Pays::Yes`: the signer pays the transaction fee on top of
+		/// passing the on-chain `IsCollator` check (minimal DOS-hardening until the
+		/// 2/3 + bond quorum follow-up lands).
 		#[pallet::call_index(2)]
-		#[pallet::weight((<T as frame_system::Config>::DbWeight::get().reads_writes(1, 1), Pays::No))]
+		#[pallet::weight((<T as frame_system::Config>::DbWeight::get().reads_writes(1, 1), Pays::Yes))]
 		pub fn blacklist_arbitrum_claim(
 			origin: OriginFor<T>,
 			state_machine_id: StateMachineId,
@@ -247,9 +289,10 @@ pub mod pallet {
 			let account = ensure_signed(origin)?;
 			ensure!(T::IsCollator::contains(&account), Error::<T>::UnauthorizedAction);
 
-			if BlacklistedArbitrumClaims::<T>::contains_key(state_machine_id, claim) {
-				return Ok(());
-			}
+			ensure!(
+				!BlacklistedArbitrumClaims::<T>::contains_key(state_machine_id, claim),
+				Error::<T>::AlreadyFinalized
+			);
 
 			BlacklistedArbitrumClaims::<T>::insert(state_machine_id, claim, account.clone());
 			Self::deposit_event(Event::ArbitrumClaimBlacklisted {
@@ -257,6 +300,51 @@ pub mod pallet {
 				claim,
 				fisherman: account,
 			});
+			Ok(())
+		}
+
+		/// Remove a finalized opstack dispute-game blacklist entry. The dispatch origin
+		/// must be `T::AdminOrigin` (governance) — the collator that submitted the
+		/// blacklist cannot retract it. Idempotent: removing a pair that is not
+		/// blacklisted is a no-op (no event emitted).
+		#[pallet::call_index(3)]
+		#[pallet::weight((<T as frame_system::Config>::DbWeight::get().reads_writes(1, 1), Pays::Yes))]
+		pub fn unblacklist_dispute_game(
+			origin: OriginFor<T>,
+			state_machine_id: StateMachineId,
+			proxy: H160,
+		) -> DispatchResult {
+			T::AdminOrigin::ensure_origin(origin)?;
+
+			if BlacklistedDisputeGames::<T>::contains_key(state_machine_id, proxy) {
+				BlacklistedDisputeGames::<T>::remove(state_machine_id, proxy);
+				Self::deposit_event(Event::DisputeGameUnblacklisted {
+					state_machine_id,
+					proxy,
+				});
+			}
+			Ok(())
+		}
+
+		/// Remove a finalized arbitrum claim blacklist entry. The dispatch origin must
+		/// be `T::AdminOrigin` (governance). Idempotent: removing a pair that is not
+		/// blacklisted is a no-op (no event emitted).
+		#[pallet::call_index(4)]
+		#[pallet::weight((<T as frame_system::Config>::DbWeight::get().reads_writes(1, 1), Pays::Yes))]
+		pub fn unblacklist_arbitrum_claim(
+			origin: OriginFor<T>,
+			state_machine_id: StateMachineId,
+			claim: H256,
+		) -> DispatchResult {
+			T::AdminOrigin::ensure_origin(origin)?;
+
+			if BlacklistedArbitrumClaims::<T>::contains_key(state_machine_id, claim) {
+				BlacklistedArbitrumClaims::<T>::remove(state_machine_id, claim);
+				Self::deposit_event(Event::ArbitrumClaimUnblacklisted {
+					state_machine_id,
+					claim,
+				});
+			}
 			Ok(())
 		}
 	}

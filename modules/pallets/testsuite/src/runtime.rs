@@ -174,6 +174,7 @@ impl frame_support::traits::Contains<AccountId32> for IsCollatorMock {
 impl pallet_fishermen::Config for Test {
 	type IsmpHost = Ismp;
 	type IsCollator = IsCollatorMock;
+	type AdminOrigin = EnsureRoot<AccountId32>;
 }
 
 impl pallet_sudo::Config for Test {

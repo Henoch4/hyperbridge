@@ -193,6 +193,7 @@ impl frame_support::traits::Contains<AccountId> for IsCollator {
 impl pallet_fishermen::Config for Runtime {
 	type IsmpHost = Ismp;
 	type IsCollator = IsCollator;
+	type AdminOrigin = EnsureRoot<AccountId>;
 }
 
 impl ismp_parachain::Config for Runtime {
